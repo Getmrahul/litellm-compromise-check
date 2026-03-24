@@ -9,25 +9,21 @@ import os
 import re
 import site
 import sys
+import tarfile
+import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
 
 BAD_VERSIONS = {"1.82.7", "1.82.8"}
-SUSPICIOUS_FILENAMES = {
-    "litellm_init.pth",
-    "sysmon.py",
-    "sysmon.service",
+CONFIRMED_IOCS = {
+    "domains": ["models.litellm.cloud"],
+    "pth_name": "litellm_init.pth",
 }
-SUSPICIOUS_PATHS = [
+COMMUNITY_REPORTED_PATHS = [
     Path.home() / ".config" / "sysmon" / "sysmon.py",
     Path.home() / ".config" / "systemd" / "user" / "sysmon.service",
 ]
-IOCS = {
-    "domains": ["models.litellm.cloud", "checkmarx.zone"],
-    "k8s_namespace_hint": "kube-system",
-    "k8s_pod_prefix_hint": "node-setup-",
-}
 MANIFEST_PATTERNS = [
     "requirements*.txt",
     "constraints*.txt",
@@ -41,7 +37,12 @@ MANIFEST_PATTERNS = [
     "setup.cfg",
 ]
 TEXT_BYTES_LIMIT = 2 * 1024 * 1024
+MAX_SITE_SEARCH_DEPTH = 8
 VERSION_RE = re.compile(r"^litellm-(?P<version>[0-9][A-Za-z0-9.\-+]*)\.dist-info$")
+ARTIFACT_RE = re.compile(
+    r"^litellm-(?P<version>1\.82\.(?:7|8))(?:[A-Za-z0-9_.\-+]*)\.(?:whl|zip|tar\.gz)$",
+    re.IGNORECASE,
+)
 BAD_REF_RE = re.compile(
     r"(?i)\blitellm\s*(?:==|===|>=|<=|~=|!=|>|<)?\s*(1\.82\.7|1\.82\.8)\b"
 )
@@ -79,6 +80,11 @@ def parse_args() -> argparse.Namespace:
         "--repo-only",
         action="store_true",
         help="Only scan the supplied paths for dependency references.",
+    )
+    parser.add_argument(
+        "--strict-exit",
+        action="store_true",
+        help="Return exit code 1 for warnings as well as critical findings.",
     )
     return parser.parse_args()
 
@@ -126,15 +132,18 @@ def candidate_python_dirs(extra_roots: Iterable[Path]) -> list[Path]:
         if not root.exists():
             continue
         try:
-            for child in root.rglob("*"):
-                if not child.is_dir():
+            for current, dirnames, _filenames in os.walk(root):
+                current_path = Path(current)
+                try:
+                    rel_parts = current_path.relative_to(root).parts
+                except ValueError:
+                    rel_parts = ()
+                if current_path.name in {"site-packages", "dist-packages"}:
+                    candidates.append(current_path)
+                    dirnames[:] = []
                     continue
-                if child.name not in {"site-packages", "dist-packages"}:
-                    continue
-                rel_parts = child.relative_to(root).parts
-                if len(rel_parts) > 8:
-                    continue
-                candidates.append(child)
+                if len(rel_parts) >= MAX_SITE_SEARCH_DEPTH:
+                    dirnames[:] = []
         except (OSError, PermissionError):
             continue
     return dedupe_paths(candidates)
@@ -145,7 +154,7 @@ def inspect_site_dir(site_dir: Path) -> list[Finding]:
     if not site_dir.exists():
         return findings
 
-    pth = site_dir / "litellm_init.pth"
+    pth = site_dir / CONFIRMED_IOCS["pth_name"]
     if pth.exists():
         findings.append(
             Finding(
@@ -178,13 +187,13 @@ def inspect_site_dir(site_dir: Path) -> list[Finding]:
                     text = record.read_text(encoding="utf-8", errors="ignore")
                 except OSError:
                     text = ""
-                if "litellm_init.pth" in text:
+                if CONFIRMED_IOCS["pth_name"] in text:
                     findings.append(
                         Finding(
                             kind="record-indicator",
                             severity="critical",
                             path=str(record),
-                            detail="RECORD references litellm_init.pth.",
+                            detail=f"RECORD references {CONFIRMED_IOCS['pth_name']}.",
                         )
                     )
     except (OSError, PermissionError):
@@ -201,16 +210,143 @@ def inspect_site_dir(site_dir: Path) -> list[Finding]:
 
 def inspect_persistence_paths() -> list[Finding]:
     findings: list[Finding] = []
-    for path in SUSPICIOUS_PATHS:
+    for path in COMMUNITY_REPORTED_PATHS:
         if path.exists():
             findings.append(
                 Finding(
-                    kind="persistence",
-                    severity="critical",
+                    kind="community-persistence",
+                    severity="warning",
                     path=str(path),
-                    detail="Found a file matching a reported persistence path.",
+                    detail="Found a community-reported persistence path. Treat this as suspicious, but not independently verified by the primary incident report.",
                 )
             )
+    return findings
+
+
+def candidate_artifact_dirs(extra_roots: Iterable[Path]) -> list[Path]:
+    candidates: list[Path] = [
+        Path.home() / ".cache" / "pip",
+        Path.home() / "Library" / "Caches" / "pip",
+    ]
+    if os.environ.get("PIP_CACHE_DIR"):
+        candidates.append(Path(os.environ["PIP_CACHE_DIR"]))
+    candidates.extend(extra_roots)
+    return [path for path in dedupe_paths(candidates) if path.exists()]
+
+
+def inspect_zip_artifact(path: Path) -> list[Finding]:
+    findings: list[Finding] = []
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = archive.namelist()
+    except (OSError, zipfile.BadZipFile):
+        return findings
+
+    if any(name.endswith(CONFIRMED_IOCS["pth_name"]) for name in names):
+        findings.append(
+            Finding(
+                kind="cached-artifact",
+                severity="critical",
+                path=str(path),
+                detail=f"Artifact contains {CONFIRMED_IOCS['pth_name']}.",
+            )
+        )
+        return findings
+
+    match = ARTIFACT_RE.match(path.name)
+    if match:
+        findings.append(
+            Finding(
+                kind="cached-artifact-version",
+                severity="warning",
+                path=str(path),
+                detail=f"Artifact filename references reported malicious version {match.group('version')}.",
+            )
+        )
+    return findings
+
+
+def inspect_tar_artifact(path: Path) -> list[Finding]:
+    findings: list[Finding] = []
+    try:
+        with tarfile.open(path) as archive:
+            names = archive.getnames()
+    except (OSError, tarfile.TarError):
+        return findings
+
+    if any(name.endswith(CONFIRMED_IOCS["pth_name"]) for name in names):
+        findings.append(
+            Finding(
+                kind="cached-artifact",
+                severity="critical",
+                path=str(path),
+                detail=f"Artifact contains {CONFIRMED_IOCS['pth_name']}.",
+            )
+        )
+        return findings
+
+    match = ARTIFACT_RE.match(path.name)
+    if match:
+        findings.append(
+            Finding(
+                kind="cached-artifact-version",
+                severity="warning",
+                path=str(path),
+                detail=f"Artifact filename references reported malicious version {match.group('version')}.",
+            )
+        )
+    return findings
+
+
+def inspect_artifact_dir(root: Path) -> list[Finding]:
+    findings: list[Finding] = []
+    try:
+        for current, dirnames, filenames in os.walk(root):
+            current_path = Path(current)
+            try:
+                rel_parts = current_path.relative_to(root).parts
+            except ValueError:
+                rel_parts = ()
+            if len(rel_parts) >= MAX_SITE_SEARCH_DEPTH:
+                dirnames[:] = []
+            for filename in filenames:
+                if not filename.startswith("litellm-") and filename != CONFIRMED_IOCS["pth_name"]:
+                    continue
+                path = current_path / filename
+                if filename == CONFIRMED_IOCS["pth_name"]:
+                    findings.append(
+                        Finding(
+                            kind="artifact-indicator",
+                            severity="critical",
+                            path=str(path),
+                            detail=f"Found unpacked {CONFIRMED_IOCS['pth_name']} in an artifact directory.",
+                        )
+                    )
+                    continue
+                if filename.endswith((".whl", ".zip")):
+                    findings.extend(inspect_zip_artifact(path))
+                elif filename.endswith(".tar.gz"):
+                    findings.extend(inspect_tar_artifact(path))
+                else:
+                    match = ARTIFACT_RE.match(filename)
+                    if match:
+                        findings.append(
+                            Finding(
+                                kind="cached-artifact-version",
+                                severity="warning",
+                                path=str(path),
+                                detail=f"Artifact filename references reported malicious version {match.group('version')}.",
+                            )
+                        )
+    except (OSError, PermissionError):
+        findings.append(
+            Finding(
+                kind="scan-error",
+                severity="info",
+                path=str(root),
+                detail="Could not fully inspect this artifact or cache directory.",
+            )
+        )
     return findings
 
 
@@ -259,7 +395,9 @@ def inspect_repo_path(root: Path) -> list[Finding]:
                         detail=line.strip()[:300],
                     )
                 )
-            elif "litellm_init.pth" in line or any(domain in line for domain in IOCS["domains"]):
+            elif CONFIRMED_IOCS["pth_name"] in line or any(
+                domain in line for domain in CONFIRMED_IOCS["domains"]
+            ):
                 findings.append(
                     Finding(
                         kind="ioc-reference",
@@ -280,7 +418,12 @@ def overall_status(findings: list[Finding]) -> str:
     return "OK"
 
 
-def print_human(findings: list[Finding], scanned_paths: list[Path], scanned_site_dirs: list[Path]) -> None:
+def print_human(
+    findings: list[Finding],
+    scanned_paths: list[Path],
+    scanned_site_dirs: list[Path],
+    scanned_artifact_dirs: list[Path],
+) -> None:
     status = overall_status(findings)
     print(f"LiteLLM compromise check: {status}")
     print()
@@ -294,6 +437,12 @@ def print_human(findings: list[Finding], scanned_paths: list[Path], scanned_site
     if scanned_paths:
         print("Repo paths checked:")
         for path in scanned_paths:
+            print(f"  - {path}")
+        print()
+
+    if scanned_artifact_dirs:
+        print("Artifact/cache paths checked:")
+        for path in scanned_artifact_dirs:
             print(f"  - {path}")
         print()
 
@@ -312,14 +461,14 @@ def print_human(findings: list[Finding], scanned_paths: list[Path], scanned_site
         print("  1. Treat the machine or environment as exposed if the bad package or litellm_init.pth was present.")
         print("  2. Remove the malicious package or environment before reusing it.")
         print("  3. Rotate secrets that may have been present: env vars, SSH keys, cloud credentials, kube tokens, CI tokens.")
-        print("  4. Check for persistence files under ~/.config/sysmon and ~/.config/systemd/user.")
+        print("  4. Check pip caches and downloaded artifacts for any cached malicious LiteLLM wheels.")
         print("  5. Search logs and infra for outbound traffic to the reported domains:")
-        for domain in IOCS["domains"]:
+        for domain in CONFIRMED_IOCS["domains"]:
             print(f"     - {domain}")
     elif status == "WARNING":
         print("  1. Update manifests and lockfiles to avoid LiteLLM 1.82.7 and 1.82.8.")
         print("  2. Verify no developer or CI environment ever installed those versions.")
-        print("  3. Re-run this script inside any virtualenvs, CI runners, or containers that may have used the package.")
+        print("  3. Re-run this script inside any virtualenvs, CI runners, containers, and pip caches that may have used the package.")
     else:
         print("  1. If you used LiteLLM recently, still verify your CI logs, virtualenvs, and ephemeral runners.")
         print("  2. Pin to a known-good version and prefer hash-locked installs for future releases.")
@@ -334,12 +483,19 @@ def main() -> int:
     repo_paths = dedupe_paths(Path(path) for path in args.paths)
     findings: list[Finding] = []
     site_dirs: list[Path] = []
+    artifact_dirs: list[Path] = []
     visible_repo_paths = [] if args.site_only else repo_paths
+    artifact_roots = repo_paths
+    if args.site_only and repo_paths == [Path.cwd().resolve()]:
+        artifact_roots = []
 
     if not args.repo_only:
         site_dirs = candidate_python_dirs(repo_paths)
         for site_dir in site_dirs:
             findings.extend(inspect_site_dir(site_dir))
+        artifact_dirs = candidate_artifact_dirs(artifact_roots)
+        for artifact_dir in artifact_dirs:
+            findings.extend(inspect_artifact_dir(artifact_dir))
         findings.extend(inspect_persistence_paths())
 
     if not args.site_only:
@@ -351,12 +507,18 @@ def main() -> int:
             "status": overall_status(findings),
             "repo_paths": [str(path) for path in visible_repo_paths],
             "python_paths": [str(path) for path in site_dirs],
+            "artifact_paths": [str(path) for path in artifact_dirs],
             "findings": [asdict(finding) for finding in findings],
         }
         print(json.dumps(payload, indent=2))
     else:
-        print_human(findings, visible_repo_paths, site_dirs)
-    return 1 if overall_status(findings) == "CRITICAL" else 0
+        print_human(findings, visible_repo_paths, site_dirs, artifact_dirs)
+    status = overall_status(findings)
+    if status == "CRITICAL":
+        return 1
+    if args.strict_exit and status == "WARNING":
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
