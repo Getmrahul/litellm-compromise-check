@@ -20,9 +20,21 @@ CONFIRMED_IOCS = {
     "domains": ["models.litellm.cloud"],
     "pth_name": "litellm_init.pth",
 }
+COMMUNITY_REPORTED_IOCS = {
+    "domains": ["checkmarx.zone"],
+}
 COMMUNITY_REPORTED_PATHS = [
     Path.home() / ".config" / "sysmon" / "sysmon.py",
     Path.home() / ".config" / "systemd" / "user" / "sysmon.service",
+]
+COMMON_ENV_ROOTS = [
+    Path.home() / ".local",
+    Path.home() / ".pyenv",
+    Path.home() / ".virtualenvs",
+    Path.home() / ".venvs",
+    Path.home() / "venvs",
+    Path.home() / ".cache" / "pypoetry" / "virtualenvs",
+    Path.home() / ".local" / "share" / "virtualenvs",
 ]
 MANIFEST_PATTERNS = [
     "requirements*.txt",
@@ -122,11 +134,9 @@ def candidate_python_dirs(extra_roots: Iterable[Path]) -> list[Path]:
             candidates.append(Path(entry))
 
     common_roots = [
-        Path.home() / ".local",
-        Path.home() / ".pyenv",
-        Path.home() / ".virtualenvs",
         Path.cwd(),
     ]
+    common_roots.extend(COMMON_ENV_ROOTS)
     common_roots.extend(extra_roots)
     for root in dedupe_paths(common_roots):
         if not root.exists():
@@ -221,6 +231,21 @@ def inspect_persistence_paths() -> list[Finding]:
                 )
             )
     return findings
+
+
+def candidate_repo_env_dirs(extra_roots: Iterable[Path]) -> list[Path]:
+    candidates: list[Path] = []
+    env_dir_names = {".venv", "venv", "env"}
+    for root in dedupe_paths(extra_roots):
+        if not root.exists() or root.is_file():
+            continue
+        for name in env_dir_names:
+            path = root / name
+            if not path.exists() or not path.is_dir():
+                continue
+            for pattern in ("**/site-packages", "**/dist-packages"):
+                candidates.extend(path.glob(pattern))
+    return dedupe_paths(candidates)
 
 
 def candidate_artifact_dirs(extra_roots: Iterable[Path]) -> list[Path]:
@@ -406,6 +431,15 @@ def inspect_repo_path(root: Path) -> list[Finding]:
                         detail=line.strip()[:300],
                     )
                 )
+            elif any(domain in line for domain in COMMUNITY_REPORTED_IOCS["domains"]):
+                findings.append(
+                    Finding(
+                        kind="community-ioc-reference",
+                        severity="warning",
+                        path=f"{path}:{index}",
+                        detail=line.strip()[:300],
+                    )
+                )
     return findings
 
 
@@ -461,16 +495,20 @@ def print_human(
         print("  1. Treat the machine or environment as exposed if the bad package or litellm_init.pth was present.")
         print("  2. Remove the malicious package or environment before reusing it.")
         print("  3. Rotate secrets that may have been present: env vars, SSH keys, cloud credentials, kube tokens, CI tokens.")
-        print("  4. Check pip caches and downloaded artifacts for any cached malicious LiteLLM wheels.")
-        print("  5. Search logs and infra for outbound traffic to the reported domains:")
+        print("  4. Check pip caches, repo-local virtualenvs, Docker images, and CI runners for cached malicious LiteLLM wheels.")
+        print("  5. Search logs and infra for outbound traffic to the confirmed domain:")
         for domain in CONFIRMED_IOCS["domains"]:
             print(f"     - {domain}")
+        if COMMUNITY_REPORTED_IOCS["domains"]:
+            print("  6. Review community-reported domains as lower-confidence leads:")
+            for domain in COMMUNITY_REPORTED_IOCS["domains"]:
+                print(f"     - {domain}")
     elif status == "WARNING":
         print("  1. Update manifests and lockfiles to avoid LiteLLM 1.82.7 and 1.82.8.")
         print("  2. Verify no developer or CI environment ever installed those versions.")
-        print("  3. Re-run this script inside any virtualenvs, CI runners, containers, and pip caches that may have used the package.")
+        print("  3. Re-run this script inside repo-local virtualenvs, CI runners, containers, and pip caches that may have used the package.")
     else:
-        print("  1. If you used LiteLLM recently, still verify your CI logs, virtualenvs, and ephemeral runners.")
+        print("  1. If you used LiteLLM recently, still verify your repo-local virtualenvs, CI logs, and ephemeral runners.")
         print("  2. Pin to a known-good version and prefer hash-locked installs for future releases.")
 
 
@@ -491,6 +529,8 @@ def main() -> int:
 
     if not args.repo_only:
         site_dirs = candidate_python_dirs(repo_paths)
+        site_dirs.extend(candidate_repo_env_dirs(repo_paths))
+        site_dirs = dedupe_paths(site_dirs)
         for site_dir in site_dirs:
             findings.extend(inspect_site_dir(site_dir))
         artifact_dirs = candidate_artifact_dirs(artifact_roots)

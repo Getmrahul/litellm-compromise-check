@@ -25,9 +25,10 @@ python3 litellm_compromise_check.py --repo-only /path/to/repo --strict-exit
 
 - installed `litellm` `1.82.7` / `1.82.8` package metadata
 - `litellm_init.pth` in Python package directories
+- common local virtualenv locations like `.venv`, `venv`, `env`, `~/.virtualenvs`, and Poetry virtualenvs
 - cached LiteLLM wheels and tarballs in pip cache
 - repo manifests and lockfiles for bad LiteLLM references
-- community-reported persistence paths under `~/.config/sysmon`
+- community-reported indicators like `checkmarx.zone` and paths under `~/.config/sysmon`
 
 ## Exit Codes
 
@@ -39,6 +40,8 @@ python3 litellm_compromise_check.py --repo-only /path/to/repo --strict-exit
 
 - This script is offline and has no third-party dependencies.
 - `1.82.8` and `litellm_init.pth` are publicly documented indicators.
-- `1.82.7` and `~/.config/sysmon` checks are included as precautionary community-reported indicators.
+- `1.82.7`, `checkmarx.zone`, and `~/.config/sysmon` checks are included as precautionary community-reported indicators.
+- Also check any Docker images and CI runners that may have installed LiteLLM.
+- Main incident thread: [LiteLLM issue #24512](https://github.com/BerriAI/litellm/issues/24512)
 
 Avoid `curl | bash`. Download the file first, then run it locally.
